@@ -572,6 +572,13 @@ func (c *Client) BuildTable(reader io.Reader, validate bool) (ResourceList, erro
 		transformRequests)
 }
 
+// objectKey identifies an object the way ResourceList.Get does: by group and kind (not
+// version), namespace and name.
+func objectKey(info *resource.Info) string {
+	gk := info.Mapping.GroupVersionKind.GroupKind()
+	return gk.String() + "/" + info.Namespace + "/" + info.Name
+}
+
 // maxConcurrentUpdates caps how many objects of one kind update() applies at the same time.
 // Each object costs a GET and a write. 64 in flight is enough to hide the round trip to the
 // API server on large releases without piling thousands of requests onto it at once.
@@ -663,9 +670,22 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 		}
 		batch := targets[start:end]
 
+		// A manifest can define the same object more than once. The sequential loop applied
+		// the definitions in manifest order, so the last one won; concurrent goroutines would
+		// make the winner a race. Apply the first definition of each object in the concurrent
+		// pass and any later definitions afterwards, in order.
+		var repeats []int
+		seen := make(map[string]struct{}, len(batch))
 		outcomes := make([]applyOutcome, len(batch))
 		var wg sync.WaitGroup
 		for i, target := range batch {
+			key := objectKey(target)
+			if _, dup := seen[key]; dup {
+				repeats = append(repeats, i)
+				continue
+			}
+			seen[key] = struct{}{}
+
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(i int, target *resource.Info) {
@@ -675,6 +695,11 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 			}(i, target)
 		}
 		wg.Wait()
+		for _, i := range repeats {
+			c.Logger().Warn("resource is defined more than once in the release; applying the later definition",
+				slog.String("namespace", batch[i].Namespace), slog.String("name", batch[i].Name), slog.String("kind", kind))
+			outcomes[i] = applyTarget(batch[i])
+		}
 
 		// Record the outcomes in target order, so Result and the errors read the same as a
 		// sequential pass would.

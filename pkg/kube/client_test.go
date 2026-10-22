@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -780,6 +781,79 @@ func TestUpdateBoundsConcurrency(t *testing.T) {
 	// requests in flight is at most the number of goroutines the pool admits.
 	assert.LessOrEqual(t, maxInFlight.Load(), int32(maxConcurrentUpdates), "more objects in flight than the pool allows")
 	assert.Greater(t, maxInFlight.Load(), int32(1), "objects were not applied concurrently")
+}
+
+// TestUpdateDuplicateDefinitionsLastWins renders the same Pod twice with different
+// labels. The sequential loop applied definitions in manifest order, so the second one
+// ended up on the cluster; the concurrent loop must keep that, not race the two.
+func TestUpdateDuplicateDefinitionsLastWins(t *testing.T) {
+	const manifest = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: twin
+  namespace: default
+  labels:
+    definition: first
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: other
+  namespace: default
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: twin
+  namespace: default
+  labels:
+    definition: second
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+`
+	var twinPatches []string
+	var mu sync.Mutex
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		if req.Method == http.MethodPatch && name == "twin" {
+			body, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			label := "?"
+			if m := regexp.MustCompile(`"definition":"(\w+)"`).FindSubmatch(body); m != nil {
+				label = string(m[1])
+			}
+			mu.Lock()
+			twinPatches = append(twinPatches, label)
+			mu.Unlock()
+		}
+		pod := newPod(name)
+		return newResponse(http.StatusOK, &pod)
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+	targets, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+	assert.Len(t, result.Updated, 3)
+	require.Equal(t, []string{"first", "second"}, twinPatches, "the later definition must be applied last")
 }
 
 // TestUpdateAppliesKindsInOrder checks the barrier between kinds: every
