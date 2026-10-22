@@ -572,6 +572,11 @@ func (c *Client) BuildTable(reader io.Reader, validate bool) (ResourceList, erro
 		transformRequests)
 }
 
+// maxConcurrentUpdates caps how many objects of one kind update() applies at the same time.
+// Each object costs a GET and a write. 64 in flight is enough to hide the round trip to the
+// API server on large releases without piling thousands of requests onto it at once.
+const maxConcurrentUpdates = 64
+
 // applyOutcome records what happened to one target during update. Created is set
 // as soon as the target is known to be missing, before the create is attempted, so a
 // failed create is still reported (and can be cleaned up) by the caller.
@@ -643,6 +648,13 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 	// at least a GET and a write, so a release with hundreds of objects applied one after
 	// another is bound by the round trip to the API server, not by the server. Create and
 	// Delete already work this way (see batchPerform).
+	//
+	// The concurrency is bounded. Starting a goroutine per object sends every request of a
+	// kind at once; on a release with over a thousand Deployments that meant 2,700 requests in
+	// flight, and the batch then waited 15-30 s for its slowest few while the API server worked
+	// through the pile. A bounded pool keeps the server's queue short, so the batch time is
+	// close to (requests / limit) x latency and does not swing from run to run.
+	sem := make(chan struct{}, maxConcurrentUpdates)
 	for start := 0; start < len(targets); {
 		kind := targets[start].Object.GetObjectKind().GroupVersionKind().Kind
 		end := start + 1
@@ -655,8 +667,10 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 		var wg sync.WaitGroup
 		for i, target := range batch {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(i int, target *resource.Info) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				outcomes[i] = applyTarget(target)
 			}(i, target)
 		}

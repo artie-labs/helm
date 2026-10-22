@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -728,6 +729,57 @@ func TestUpdateAppliesKindConcurrently(t *testing.T) {
 	for i, info := range result.Updated {
 		assert.Equal(t, pods.Items[i].Name, info.Name)
 	}
+}
+
+// TestUpdateBoundsConcurrency applies more objects than maxConcurrentUpdates and
+// checks that no more than that many were in flight at once, while still more than one.
+func TestUpdateBoundsConcurrency(t *testing.T) {
+	const podCount = maxConcurrentUpdates * 3
+	names := make([]string, podCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("pod-%03d", i)
+	}
+	pods := newPodList(names...)
+
+	var inFlight, maxInFlight atomic.Int32
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			seen := maxInFlight.Load()
+			if n <= seen || maxInFlight.CompareAndSwap(seen, n) {
+				break
+			}
+		}
+		// Hold the request open long enough for the pool to fill.
+		time.Sleep(5 * time.Millisecond)
+
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		index := slices.IndexFunc(pods.Items, func(pod v1.Pod) bool { return pod.Name == name })
+		if index < 0 {
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			return newResponse(http.StatusInternalServerError, &metav1.Status{Code: http.StatusInternalServerError})
+		}
+		return newResponse(http.StatusOK, &pods.Items[index])
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+	targets, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+	assert.Len(t, result.Updated, podCount)
+
+	// Each object makes a GET and then a PATCH from the same goroutine, so the number of
+	// requests in flight is at most the number of goroutines the pool admits.
+	assert.LessOrEqual(t, maxInFlight.Load(), int32(maxConcurrentUpdates), "more objects in flight than the pool allows")
+	assert.Greater(t, maxInFlight.Load(), int32(1), "objects were not applied concurrently")
 }
 
 // TestUpdateAppliesKindsInOrder checks the barrier between kinds: every
