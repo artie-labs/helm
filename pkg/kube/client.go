@@ -572,28 +572,33 @@ func (c *Client) BuildTable(reader io.Reader, validate bool) (ResourceList, erro
 		transformRequests)
 }
 
+// applyOutcome records what happened to one target during update. Created is set
+// as soon as the target is known to be missing, before the create is attempted, so a
+// failed create is still reported (and can be cleaned up) by the caller.
+type applyOutcome struct {
+	created   bool
+	updated   bool
+	updateErr error
+	// fatalErr stops the update: the target could not be inspected or created.
+	fatalErr error
+}
+
 func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateApplyFunc, updateApplyFunc UpdateApplyFunc) (*Result, error) {
 	updateErrors := []error{}
 	res := &Result{}
 
 	c.Logger().Debug("checking resources for changes", "resources", len(targets))
-	err := targets.Visit(func(target *resource.Info, err error) error {
-		if err != nil {
-			return err
-		}
 
+	applyTarget := func(target *resource.Info) applyOutcome {
 		helper := resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager())
 		if _, err := helper.Get(target.Namespace, target.Name); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("could not get information about the resource: %w", err)
+				return applyOutcome{fatalErr: fmt.Errorf("could not get information about the resource: %w", err)}
 			}
-
-			// Append the created resource to the results, even if something fails
-			res.Created = append(res.Created, target)
 
 			// Since the resource does not exist, create it.
 			if err := createApplyFunc(target); err != nil {
-				return fmt.Errorf("failed to create resource: %w", err)
+				return applyOutcome{created: true, fatalErr: fmt.Errorf("failed to create resource: %w", err)}
 			}
 
 			kind := target.Mapping.GroupVersionKind.Kind
@@ -603,7 +608,7 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 				slog.String("name", target.Name),
 				slog.String("kind", kind),
 			)
-			return nil
+			return applyOutcome{created: true}
 		}
 
 		original := originals.Get(target)
@@ -615,42 +620,72 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 
 			currentObj, err := helper.Get(target.Namespace, target.Name)
 			if err != nil {
-				return fmt.Errorf("original object %s with the name %q not found", kind, target.Name)
+				return applyOutcome{fatalErr: fmt.Errorf("original object %s with the name %q not found", kind, target.Name)}
 			}
 
 			// Create a temporary Info with the current cluster state to use as "original"
-			currentInfo := &resource.Info{
+			original = &resource.Info{
 				Client:    target.Client,
 				Mapping:   target.Mapping,
 				Namespace: target.Namespace,
 				Name:      target.Name,
 				Object:    currentObj,
 			}
+		}
 
-			if err := updateApplyFunc(currentInfo, target); err != nil {
-				updateErrors = append(updateErrors, err)
+		// The target is reported as updated even when the update fails, because errors are checked later.
+		return applyOutcome{updated: true, updateErr: updateApplyFunc(original, target)}
+	}
+
+	// Targets arrive in install order, so the kinds a resource can depend on (ConfigMaps,
+	// Secrets, ServiceAccounts, ...) come before the kinds that use them. Apply one kind at a
+	// time to keep that guarantee, and the objects of a kind concurrently: each object costs
+	// at least a GET and a write, so a release with hundreds of objects applied one after
+	// another is bound by the round trip to the API server, not by the server. Create and
+	// Delete already work this way (see batchPerform).
+	for start := 0; start < len(targets); {
+		kind := targets[start].Object.GetObjectKind().GroupVersionKind().Kind
+		end := start + 1
+		for end < len(targets) && targets[end].Object.GetObjectKind().GroupVersionKind().Kind == kind {
+			end++
+		}
+		batch := targets[start:end]
+
+		outcomes := make([]applyOutcome, len(batch))
+		var wg sync.WaitGroup
+		for i, target := range batch {
+			wg.Add(1)
+			go func(i int, target *resource.Info) {
+				defer wg.Done()
+				outcomes[i] = applyTarget(target)
+			}(i, target)
+		}
+		wg.Wait()
+
+		// Record the outcomes in target order, so Result and the errors read the same as a
+		// sequential pass would.
+		var fatalErr error
+		for i, outcome := range outcomes {
+			target := batch[i]
+			if outcome.created {
+				res.Created = append(res.Created, target)
 			}
-
-			// Because we check for errors later, append the info regardless
-			res.Updated = append(res.Updated, target)
-
-			return nil
+			if outcome.updated {
+				res.Updated = append(res.Updated, target)
+			}
+			if outcome.updateErr != nil {
+				updateErrors = append(updateErrors, outcome.updateErr)
+			}
+			fatalErr = errors.Join(fatalErr, outcome.fatalErr)
+		}
+		if fatalErr != nil {
+			return res, fatalErr
 		}
 
-		if err := updateApplyFunc(original, target); err != nil {
-			updateErrors = append(updateErrors, err)
-		}
+		start = end
+	}
 
-		// Because we check for errors later, append the info regardless
-		res.Updated = append(res.Updated, target)
-
-		return nil
-	})
-
-	switch {
-	case err != nil:
-		return res, err
-	case len(updateErrors) != 0:
+	if len(updateErrors) != 0 {
 		return res, joinErrors(updateErrors, " && ")
 	}
 
