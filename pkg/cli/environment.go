@@ -118,27 +118,33 @@ func New() *EnvSettings {
 	}
 	env.Debug, _ = strconv.ParseBool(os.Getenv("HELM_DEBUG"))
 
-	// bind to kubernetes config flags
-	config := &genericclioptions.ConfigFlags{
-		Namespace:        &env.namespace,
-		Context:          &env.KubeContext,
-		BearerToken:      &env.KubeToken,
-		APIServer:        &env.KubeAPIServer,
-		CAFile:           &env.KubeCaFile,
-		KubeConfig:       &env.KubeConfig,
-		Impersonate:      &env.KubeAsUser,
-		Insecure:         &env.KubeInsecureSkipTLSVerify,
-		TLSServerName:    &env.KubeTLSServerName,
-		ImpersonateGroup: &env.KubeAsGroups,
-		WrapConfigFn: func(config *rest.Config) *rest.Config {
-			config.Burst = env.BurstLimit
-			config.QPS = env.QPS
-			config.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-				return &kubeenv.RetryingRoundTripper{Wrapped: rt}
-			})
-			config.UserAgent = version.GetUserAgent()
-			return config
-		},
+	// bind to kubernetes config flags.
+	//
+	// The flags are created with usePersistentConfig so that they memoize the
+	// discovery client and the REST mapper. The resource builder asks the getter
+	// for a mapper once per object it builds, and a non-persistent ConfigFlags
+	// answers each call with a new discovery client, so every object in a
+	// manifest re-runs API discovery (two round trips to the API server). On a
+	// release with hundreds of objects that is most of an install or upgrade.
+	config := genericclioptions.NewConfigFlags(true)
+	config.Namespace = &env.namespace
+	config.Context = &env.KubeContext
+	config.BearerToken = &env.KubeToken
+	config.APIServer = &env.KubeAPIServer
+	config.CAFile = &env.KubeCaFile
+	config.KubeConfig = &env.KubeConfig
+	config.Impersonate = &env.KubeAsUser
+	config.Insecure = &env.KubeInsecureSkipTLSVerify
+	config.TLSServerName = &env.KubeTLSServerName
+	config.ImpersonateGroup = &env.KubeAsGroups
+	config.WrapConfigFn = func(config *rest.Config) *rest.Config {
+		config.Burst = env.BurstLimit
+		config.QPS = env.QPS
+		config.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return &kubeenv.RetryingRoundTripper{Wrapped: rt}
+		})
+		config.UserAgent = version.GetUserAgent()
+		return config
 	}
 	if env.BurstLimit != defaultBurstLimit {
 		config = config.WithDiscoveryBurst(env.BurstLimit)

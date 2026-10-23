@@ -20,10 +20,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +57,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 	"k8s.io/client-go/util/retry"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
@@ -65,6 +71,35 @@ var (
 func objBody(obj runtime.Object) io.ReadCloser {
 	return io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(codec, obj))))
 }
+
+// concurrentRESTClient builds the same requests as fake.RESTClient (same host, no
+// API path prefix, unstructured serializer) but keeps no per-request state, so it
+// can serve requests made concurrently. fake.RESTClient records the last request
+// on itself, which races once Update applies the objects of a kind in parallel.
+type concurrentRESTClient struct {
+	httpClient *http.Client
+}
+
+func newConcurrentRESTClient(do func(*http.Request) (*http.Response, error)) *concurrentRESTClient {
+	return &concurrentRESTClient{httpClient: fake.CreateHTTPClient(do)}
+}
+
+func (c *concurrentRESTClient) Verb(verb string) *rest.Request {
+	config := rest.ClientContentConfig{
+		ContentType: runtime.ContentTypeJSON,
+		Negotiator:  runtime.NewClientNegotiator(unstructuredSerializer, schema.GroupVersion{}),
+	}
+	return rest.NewRequestWithClient(&url.URL{Scheme: "https", Host: "localhost"}, "", config, c.httpClient).Verb(verb)
+}
+
+func (c *concurrentRESTClient) Get() *rest.Request    { return c.Verb(http.MethodGet) }
+func (c *concurrentRESTClient) Put() *rest.Request    { return c.Verb(http.MethodPut) }
+func (c *concurrentRESTClient) Post() *rest.Request   { return c.Verb(http.MethodPost) }
+func (c *concurrentRESTClient) Delete() *rest.Request { return c.Verb(http.MethodDelete) }
+func (c *concurrentRESTClient) Patch(pt types.PatchType) *rest.Request {
+	return c.Verb(http.MethodPatch).SetHeader("Content-Type", string(pt))
+}
+func (c *concurrentRESTClient) APIVersion() schema.GroupVersion { return schema.GroupVersion{} }
 
 func newPod(name string) v1.Pod {
 	return newPodWithStatus(name, v1.PodStatus{}, "")
@@ -112,7 +147,9 @@ func notFoundBody() *metav1.Status {
 func newResponse(code int, obj runtime.Object) (*http.Response, error) {
 	header := http.Header{}
 	header.Set("Content-Type", runtime.ContentTypeJSON)
-	body := io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(codec, obj))))
+	// Encode a copy: the codec writes the object's TypeMeta while encoding, and tests
+	// serve the same fixture object to requests that now arrive concurrently.
+	body := io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(codec, obj.DeepCopyObject()))))
 	return &http.Response{StatusCode: code, Header: header, Body: body}, nil
 }
 
@@ -182,7 +219,11 @@ func (r *RequestResponseLogClient) Do(req *http.Request) (*http.Response, error)
 		req.Body = io.NopCloser(bytes.NewReader(reqBytes))
 	}
 
-	resp, err := r.cb(r.Actions, req)
+	r.actionsLock.Lock()
+	previous := slices.Clone(r.Actions)
+	r.actionsLock.Unlock()
+
+	resp, err := r.cb(previous, req)
 
 	respBytes := readBodyBytes(resp.Body)
 	t.Logf("Response: %d %s", resp.StatusCode, string(respBytes))
@@ -533,16 +574,17 @@ func TestUpdate(t *testing.T) {
 					})
 				}
 
-				t.FailNow()
-				return nil, nil
+				t.Errorf("unexpected request %s %s", m, p)
+				return newResponse(http.StatusInternalServerError, &metav1.Status{
+					Status:  metav1.StatusFailure,
+					Message: "unexpected request",
+					Code:    http.StatusInternalServerError,
+				})
 			}
 
 			client := NewRequestResponseLogClient(t, cb)
 
-			c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = &fake.RESTClient{
-				NegotiatedSerializer: unstructuredSerializer,
-				Client:               fake.CreateHTTPClient(client.Do),
-			}
+			c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
 
 			first, err := c.Build(objBody(&listOriginal), false)
 			require.NoError(t, err)
@@ -587,9 +629,308 @@ func TestUpdate(t *testing.T) {
 				actions = append(actions, path+":"+method)
 			}
 
-			assert.Equal(t, tc.ExpectedActions, actions)
+			assertUpdateActions(t, tc.ExpectedActions, actions)
 		})
 	}
+}
+
+// assertUpdateActions checks the requests an Update made against the expected
+// sequence. Objects of one kind are applied concurrently, so their requests
+// interleave; what must hold is that the same requests were made, that each
+// object saw its own requests in order, and that every delete came after the
+// last create or update.
+func assertUpdateActions(t *testing.T, expected, actual []string) {
+	t.Helper()
+
+	assert.ElementsMatch(t, expected, actual)
+
+	byPath := func(actions []string) map[string][]string {
+		out := map[string][]string{}
+		for _, action := range actions {
+			path, _, _ := strings.Cut(action, ":")
+			out[path] = append(out[path], action)
+		}
+		return out
+	}
+	expectedByPath, actualByPath := byPath(expected), byPath(actual)
+	for path, want := range expectedByPath {
+		assert.Equal(t, want, actualByPath[path], "requests for %s out of order", path)
+	}
+
+	deletedPaths := map[string]bool{}
+	for _, action := range expected {
+		if path, method, _ := strings.Cut(action, ":"); method == http.MethodDelete {
+			deletedPaths[path] = true
+		}
+	}
+	lastApply, firstDelete := -1, len(actual)
+	for i, action := range actual {
+		path, _, _ := strings.Cut(action, ":")
+		if deletedPaths[path] {
+			firstDelete = min(firstDelete, i)
+		} else {
+			lastApply = max(lastApply, i)
+		}
+	}
+	assert.Less(t, lastApply, firstDelete, "deletes must start after the last create or update")
+}
+
+// TestUpdateAppliesKindConcurrently blocks every GET until the GETs for all
+// pods have arrived. A sequential update would never issue the second GET
+// before the first returned, so the barrier would time out.
+func TestUpdateAppliesKindConcurrently(t *testing.T) {
+	const podCount = 4
+	pods := newPodList("starfish", "otter", "dolphin", "squid")
+
+	var arrived atomic.Int32
+	allArrived := make(chan struct{})
+	var timedOut atomic.Bool
+
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		index := slices.IndexFunc(pods.Items, func(pod v1.Pod) bool { return pod.Name == name })
+		require.GreaterOrEqual(t, index, 0, "unexpected request %s %s", req.Method, req.URL.Path)
+
+		switch req.Method {
+		case http.MethodGet:
+			// Only the existence check is a GET under server-side apply, so one per pod.
+			if arrived.Add(1) == podCount {
+				close(allArrived)
+			}
+			select {
+			case <-allArrived:
+			case <-time.After(5 * time.Second):
+				timedOut.Store(true)
+			}
+			return newResponse(http.StatusOK, &pods.Items[index])
+		case http.MethodPatch:
+			return newResponse(http.StatusOK, &pods.Items[index])
+		}
+
+		t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+		return newResponse(http.StatusInternalServerError, &metav1.Status{Code: http.StatusInternalServerError})
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+	targets, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+
+	assert.False(t, timedOut.Load(), "GETs for the %d pods were not in flight at the same time", podCount)
+	assert.Len(t, result.Updated, podCount)
+	assert.Empty(t, result.Created)
+	// Result lists targets in their original order even though they were applied concurrently.
+	for i, info := range result.Updated {
+		assert.Equal(t, pods.Items[i].Name, info.Name)
+	}
+}
+
+// TestUpdateBoundsConcurrency applies more objects than maxConcurrentUpdates and
+// checks that no more than that many were in flight at once, while still more than one.
+func TestUpdateBoundsConcurrency(t *testing.T) {
+	const podCount = maxConcurrentUpdates * 3
+	names := make([]string, podCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("pod-%03d", i)
+	}
+	pods := newPodList(names...)
+
+	var inFlight, maxInFlight atomic.Int32
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			seen := maxInFlight.Load()
+			if n <= seen || maxInFlight.CompareAndSwap(seen, n) {
+				break
+			}
+		}
+		// Hold the request open long enough for the pool to fill.
+		time.Sleep(5 * time.Millisecond)
+
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		index := slices.IndexFunc(pods.Items, func(pod v1.Pod) bool { return pod.Name == name })
+		if index < 0 {
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			return newResponse(http.StatusInternalServerError, &metav1.Status{Code: http.StatusInternalServerError})
+		}
+		return newResponse(http.StatusOK, &pods.Items[index])
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+	targets, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+	assert.Len(t, result.Updated, podCount)
+
+	// Each object makes a GET and then a PATCH from the same goroutine, so the number of
+	// requests in flight is at most the number of goroutines the pool admits.
+	assert.LessOrEqual(t, maxInFlight.Load(), int32(maxConcurrentUpdates), "more objects in flight than the pool allows")
+	assert.Greater(t, maxInFlight.Load(), int32(1), "objects were not applied concurrently")
+}
+
+// TestUpdateDuplicateDefinitionsLastWins renders the same Pod twice with different
+// labels. The sequential loop applied definitions in manifest order, so the second one
+// ended up on the cluster; the concurrent loop must keep that, not race the two.
+func TestUpdateDuplicateDefinitionsLastWins(t *testing.T) {
+	const manifest = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: twin
+  namespace: default
+  labels:
+    definition: first
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: other
+  namespace: default
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: twin
+  namespace: default
+  labels:
+    definition: second
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+`
+	var twinPatches []string
+	var mu sync.Mutex
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		if req.Method == http.MethodPatch && name == "twin" {
+			body, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			label := "?"
+			if m := regexp.MustCompile(`"definition":"(\w+)"`).FindSubmatch(body); m != nil {
+				label = string(m[1])
+			}
+			mu.Lock()
+			twinPatches = append(twinPatches, label)
+			mu.Unlock()
+		}
+		pod := newPod(name)
+		return newResponse(http.StatusOK, &pod)
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+	targets, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+	assert.Len(t, result.Updated, 3)
+	require.Equal(t, []string{"first", "second"}, twinPatches, "the later definition must be applied last")
+}
+
+// TestUpdateAppliesKindsInOrder checks the barrier between kinds: every
+// request for the ConfigMaps, which come first in install order, completes
+// before the first request for a Pod is sent.
+func TestUpdateAppliesKindsInOrder(t *testing.T) {
+	const manifest = `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-a
+  namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-b
+  namespace: default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-a
+  namespace: default
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-b
+  namespace: default
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+`
+
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		// Answer with the object that was asked for: Helm refreshes the target from the
+		// response, and a different name would make the originals look removed.
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		// Hold every ConfigMap request briefly, so a missing barrier would let a Pod request overtake it.
+		if strings.Contains(req.URL.Path, "/configmaps/") {
+			time.Sleep(50 * time.Millisecond)
+			return newResponse(http.StatusOK, &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: v1.NamespaceDefault}})
+		}
+		pod := newPod(name)
+		return newResponse(http.StatusOK, &pod)
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+	targets, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+
+	result, err := c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.NoError(t, err)
+	assert.Len(t, result.Updated, 4)
+	assert.Empty(t, result.Deleted)
+
+	lastConfigMap, firstPod := -1, len(client.Actions)
+	for i, action := range client.Actions {
+		switch {
+		case strings.Contains(action.Request.URL.Path, "/configmaps/"):
+			lastConfigMap = max(lastConfigMap, i)
+		case strings.Contains(action.Request.URL.Path, "/pods/"):
+			firstPod = min(firstPod, i)
+		}
+	}
+	assert.Less(t, lastConfigMap, firstPod, "a Pod request was sent before the ConfigMaps finished")
 }
 
 func TestBuild(t *testing.T) {

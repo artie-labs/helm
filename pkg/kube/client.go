@@ -572,28 +572,39 @@ func (c *Client) BuildTable(reader io.Reader, validate bool) (ResourceList, erro
 		transformRequests)
 }
 
+// maxConcurrentUpdates is the limit forEachKindBatch applies in update(): how many objects
+// of one kind are in flight at once. Each object costs a GET and a write. 64 is enough to
+// hide the round trip to the API server on large releases without piling thousands of
+// requests onto it at once.
+const maxConcurrentUpdates = 64
+
+// applyOutcome records what happened to one target during update. Created is set
+// as soon as the target is known to be missing, before the create is attempted, so a
+// failed create is still reported (and can be cleaned up) by the caller.
+type applyOutcome struct {
+	created   bool
+	updated   bool
+	updateErr error
+	// fatalErr stops the update: the target could not be inspected or created.
+	fatalErr error
+}
+
 func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateApplyFunc, updateApplyFunc UpdateApplyFunc) (*Result, error) {
 	updateErrors := []error{}
 	res := &Result{}
 
 	c.Logger().Debug("checking resources for changes", "resources", len(targets))
-	err := targets.Visit(func(target *resource.Info, err error) error {
-		if err != nil {
-			return err
-		}
 
+	applyTarget := func(target *resource.Info) applyOutcome {
 		helper := resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager())
 		if _, err := helper.Get(target.Namespace, target.Name); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("could not get information about the resource: %w", err)
+				return applyOutcome{fatalErr: fmt.Errorf("could not get information about the resource: %w", err)}
 			}
-
-			// Append the created resource to the results, even if something fails
-			res.Created = append(res.Created, target)
 
 			// Since the resource does not exist, create it.
 			if err := createApplyFunc(target); err != nil {
-				return fmt.Errorf("failed to create resource: %w", err)
+				return applyOutcome{created: true, fatalErr: fmt.Errorf("failed to create resource: %w", err)}
 			}
 
 			kind := target.Mapping.GroupVersionKind.Kind
@@ -603,7 +614,7 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 				slog.String("name", target.Name),
 				slog.String("kind", kind),
 			)
-			return nil
+			return applyOutcome{created: true}
 		}
 
 		original := originals.Get(target)
@@ -615,42 +626,50 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 
 			currentObj, err := helper.Get(target.Namespace, target.Name)
 			if err != nil {
-				return fmt.Errorf("original object %s with the name %q not found", kind, target.Name)
+				return applyOutcome{fatalErr: fmt.Errorf("original object %s with the name %q not found", kind, target.Name)}
 			}
 
 			// Create a temporary Info with the current cluster state to use as "original"
-			currentInfo := &resource.Info{
+			original = &resource.Info{
 				Client:    target.Client,
 				Mapping:   target.Mapping,
 				Namespace: target.Namespace,
 				Name:      target.Name,
 				Object:    currentObj,
 			}
-
-			if err := updateApplyFunc(currentInfo, target); err != nil {
-				updateErrors = append(updateErrors, err)
-			}
-
-			// Because we check for errors later, append the info regardless
-			res.Updated = append(res.Updated, target)
-
-			return nil
 		}
 
-		if err := updateApplyFunc(original, target); err != nil {
-			updateErrors = append(updateErrors, err)
-		}
+		// The target is reported as updated even when the update fails, because errors are checked later.
+		return applyOutcome{updated: true, updateErr: updateApplyFunc(original, target)}
+	}
 
-		// Because we check for errors later, append the info regardless
-		res.Updated = append(res.Updated, target)
-
-		return nil
+	// Targets arrive in install order, so the kinds a resource can depend on (ConfigMaps,
+	// Secrets, ServiceAccounts, ...) come before the kinds that use them. forEachKindBatch
+	// keeps that order between kinds and applies the objects of a kind concurrently.
+	outcomes := make([]applyOutcome, len(targets))
+	fatalErr := forEachKindBatch(targets, maxConcurrentUpdates, func(i int) error {
+		outcomes[i] = applyTarget(targets[i])
+		return outcomes[i].fatalErr
 	})
 
-	switch {
-	case err != nil:
-		return res, err
-	case len(updateErrors) != 0:
+	// Record the outcomes in target order, so Result and the errors read the same as a
+	// sequential pass would.
+	for i, outcome := range outcomes {
+		if outcome.created {
+			res.Created = append(res.Created, targets[i])
+		}
+		if outcome.updated {
+			res.Updated = append(res.Updated, targets[i])
+		}
+		if outcome.updateErr != nil {
+			updateErrors = append(updateErrors, outcome.updateErr)
+		}
+	}
+	if fatalErr != nil {
+		return res, fatalErr
+	}
+
+	if len(updateErrors) != 0 {
 		return res, joinErrors(updateErrors, " && ")
 	}
 
@@ -794,6 +813,76 @@ func ClientUpdateOptionUpgradeClientSideFieldManager(upgradeClientSideFieldManag
 
 		return nil
 	}
+}
+
+// forEachKindBatch calls fn for every index of list. It visits the objects of one kind at a
+// time, in list order, so a kind that others depend on (ConfigMaps before Deployments) is
+// finished before the next kind starts, and it visits the objects of a kind concurrently,
+// at most limit at a time. Each object costs at least a GET and a write, so a release with
+// hundreds of objects visited one after another is bound by the round trip to the API
+// server; the limit keeps a large kind from putting thousands of requests on the server
+// at once, where the slowest of them would set the batch time.
+//
+// A kind whose objects define the same object more than once is visited sequentially, so
+// the later definition is still applied after the earlier one, as it was when the whole
+// list was sequential. The first error returned by fn ends the walk after its batch.
+func forEachKindBatch(list ResourceList, limit int, fn func(i int) error) error {
+	sem := make(chan struct{}, limit)
+	for start := 0; start < len(list); {
+		kind := list[start].Object.GetObjectKind().GroupVersionKind().Kind
+		end := start + 1
+		for end < len(list) && list[end].Object.GetObjectKind().GroupVersionKind().Kind == kind {
+			end++
+		}
+		batch := list[start:end]
+
+		var mu sync.Mutex
+		var batchErr error
+		call := func(i int) {
+			if err := fn(i); err != nil {
+				mu.Lock()
+				batchErr = errors.Join(batchErr, err)
+				mu.Unlock()
+			}
+		}
+
+		if hasDuplicate(batch) {
+			for i := start; i < end; i++ {
+				call(i)
+			}
+		} else {
+			var wg sync.WaitGroup
+			for i := start; i < end; i++ {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					call(i)
+				}(i)
+			}
+			wg.Wait()
+		}
+		if batchErr != nil {
+			return batchErr
+		}
+		start = end
+	}
+	return nil
+}
+
+// hasDuplicate reports whether list defines the same object (as ResourceList.Get matches
+// it: group, kind, namespace and name) more than once.
+func hasDuplicate(list ResourceList) bool {
+	seen := make(map[string]struct{}, len(list))
+	for _, info := range list {
+		key := info.Mapping.GroupVersionKind.GroupKind().String() + "/" + info.Namespace + "/" + info.Name
+		if _, ok := seen[key]; ok {
+			return true
+		}
+		seen[key] = struct{}{}
+	}
+	return false
 }
 
 // Update takes the current list of objects and target list of objects and
