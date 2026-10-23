@@ -572,16 +572,10 @@ func (c *Client) BuildTable(reader io.Reader, validate bool) (ResourceList, erro
 		transformRequests)
 }
 
-// objectKey identifies an object the way ResourceList.Get does: by group and kind (not
-// version), namespace and name.
-func objectKey(info *resource.Info) string {
-	gk := info.Mapping.GroupVersionKind.GroupKind()
-	return gk.String() + "/" + info.Namespace + "/" + info.Name
-}
-
-// maxConcurrentUpdates caps how many objects of one kind update() applies at the same time.
-// Each object costs a GET and a write. 64 in flight is enough to hide the round trip to the
-// API server on large releases without piling thousands of requests onto it at once.
+// maxConcurrentUpdates is the limit forEachKindBatch applies in update(): how many objects
+// of one kind are in flight at once. Each object costs a GET and a write. 64 is enough to
+// hide the round trip to the API server on large releases without piling thousands of
+// requests onto it at once.
 const maxConcurrentUpdates = 64
 
 // applyOutcome records what happened to one target during update. Created is set
@@ -650,78 +644,29 @@ func (c *Client) update(originals, targets ResourceList, createApplyFunc CreateA
 	}
 
 	// Targets arrive in install order, so the kinds a resource can depend on (ConfigMaps,
-	// Secrets, ServiceAccounts, ...) come before the kinds that use them. Apply one kind at a
-	// time to keep that guarantee, and the objects of a kind concurrently: each object costs
-	// at least a GET and a write, so a release with hundreds of objects applied one after
-	// another is bound by the round trip to the API server, not by the server. Create and
-	// Delete already work this way (see batchPerform).
-	//
-	// The concurrency is bounded. Starting a goroutine per object sends every request of a
-	// kind at once; on a release with over a thousand Deployments that meant 2,700 requests in
-	// flight, and the batch then waited 15-30 s for its slowest few while the API server worked
-	// through the pile. A bounded pool keeps the server's queue short, so the batch time is
-	// close to (requests / limit) x latency and does not swing from run to run.
-	sem := make(chan struct{}, maxConcurrentUpdates)
-	for start := 0; start < len(targets); {
-		kind := targets[start].Object.GetObjectKind().GroupVersionKind().Kind
-		end := start + 1
-		for end < len(targets) && targets[end].Object.GetObjectKind().GroupVersionKind().Kind == kind {
-			end++
-		}
-		batch := targets[start:end]
+	// Secrets, ServiceAccounts, ...) come before the kinds that use them. forEachKindBatch
+	// keeps that order between kinds and applies the objects of a kind concurrently.
+	outcomes := make([]applyOutcome, len(targets))
+	fatalErr := forEachKindBatch(targets, maxConcurrentUpdates, func(i int) error {
+		outcomes[i] = applyTarget(targets[i])
+		return outcomes[i].fatalErr
+	})
 
-		// A manifest can define the same object more than once. The sequential loop applied
-		// the definitions in manifest order, so the last one won; concurrent goroutines would
-		// make the winner a race. Apply the first definition of each object in the concurrent
-		// pass and any later definitions afterwards, in order.
-		var repeats []int
-		seen := make(map[string]struct{}, len(batch))
-		outcomes := make([]applyOutcome, len(batch))
-		var wg sync.WaitGroup
-		for i, target := range batch {
-			key := objectKey(target)
-			if _, dup := seen[key]; dup {
-				repeats = append(repeats, i)
-				continue
-			}
-			seen[key] = struct{}{}
-
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(i int, target *resource.Info) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				outcomes[i] = applyTarget(target)
-			}(i, target)
+	// Record the outcomes in target order, so Result and the errors read the same as a
+	// sequential pass would.
+	for i, outcome := range outcomes {
+		if outcome.created {
+			res.Created = append(res.Created, targets[i])
 		}
-		wg.Wait()
-		for _, i := range repeats {
-			c.Logger().Warn("resource is defined more than once in the release; applying the later definition",
-				slog.String("namespace", batch[i].Namespace), slog.String("name", batch[i].Name), slog.String("kind", kind))
-			outcomes[i] = applyTarget(batch[i])
+		if outcome.updated {
+			res.Updated = append(res.Updated, targets[i])
 		}
-
-		// Record the outcomes in target order, so Result and the errors read the same as a
-		// sequential pass would.
-		var fatalErr error
-		for i, outcome := range outcomes {
-			target := batch[i]
-			if outcome.created {
-				res.Created = append(res.Created, target)
-			}
-			if outcome.updated {
-				res.Updated = append(res.Updated, target)
-			}
-			if outcome.updateErr != nil {
-				updateErrors = append(updateErrors, outcome.updateErr)
-			}
-			fatalErr = errors.Join(fatalErr, outcome.fatalErr)
+		if outcome.updateErr != nil {
+			updateErrors = append(updateErrors, outcome.updateErr)
 		}
-		if fatalErr != nil {
-			return res, fatalErr
-		}
-
-		start = end
+	}
+	if fatalErr != nil {
+		return res, fatalErr
 	}
 
 	if len(updateErrors) != 0 {
@@ -868,6 +813,76 @@ func ClientUpdateOptionUpgradeClientSideFieldManager(upgradeClientSideFieldManag
 
 		return nil
 	}
+}
+
+// forEachKindBatch calls fn for every index of list. It visits the objects of one kind at a
+// time, in list order, so a kind that others depend on (ConfigMaps before Deployments) is
+// finished before the next kind starts, and it visits the objects of a kind concurrently,
+// at most limit at a time. Each object costs at least a GET and a write, so a release with
+// hundreds of objects visited one after another is bound by the round trip to the API
+// server; the limit keeps a large kind from putting thousands of requests on the server
+// at once, where the slowest of them would set the batch time.
+//
+// A kind whose objects define the same object more than once is visited sequentially, so
+// the later definition is still applied after the earlier one, as it was when the whole
+// list was sequential. The first error returned by fn ends the walk after its batch.
+func forEachKindBatch(list ResourceList, limit int, fn func(i int) error) error {
+	sem := make(chan struct{}, limit)
+	for start := 0; start < len(list); {
+		kind := list[start].Object.GetObjectKind().GroupVersionKind().Kind
+		end := start + 1
+		for end < len(list) && list[end].Object.GetObjectKind().GroupVersionKind().Kind == kind {
+			end++
+		}
+		batch := list[start:end]
+
+		var mu sync.Mutex
+		var batchErr error
+		call := func(i int) {
+			if err := fn(i); err != nil {
+				mu.Lock()
+				batchErr = errors.Join(batchErr, err)
+				mu.Unlock()
+			}
+		}
+
+		if hasDuplicate(batch) {
+			for i := start; i < end; i++ {
+				call(i)
+			}
+		} else {
+			var wg sync.WaitGroup
+			for i := start; i < end; i++ {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					call(i)
+				}(i)
+			}
+			wg.Wait()
+		}
+		if batchErr != nil {
+			return batchErr
+		}
+		start = end
+	}
+	return nil
+}
+
+// hasDuplicate reports whether list defines the same object (as ResourceList.Get matches
+// it: group, kind, namespace and name) more than once.
+func hasDuplicate(list ResourceList) bool {
+	seen := make(map[string]struct{}, len(list))
+	for _, info := range list {
+		key := info.Mapping.GroupVersionKind.GroupKind().String() + "/" + info.Namespace + "/" + info.Name
+		if _, ok := seen[key]; ok {
+			return true
+		}
+		seen[key] = struct{}{}
+	}
+	return false
 }
 
 // Update takes the current list of objects and target list of objects and
