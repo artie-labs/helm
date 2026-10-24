@@ -827,6 +827,9 @@ func ClientUpdateOptionUpgradeClientSideFieldManager(upgradeClientSideFieldManag
 // the later definition is still applied after the earlier one, as it was when the whole
 // list was sequential. The first error returned by fn ends the walk after its batch.
 func forEachKindBatch(list ResourceList, limit int, fn func(i int) error) error {
+	if limit < 1 {
+		limit = 1
+	}
 	sem := make(chan struct{}, limit)
 	for start := 0; start < len(list); {
 		kind := list[start].Object.GetObjectKind().GroupVersionKind().Kind

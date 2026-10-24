@@ -856,6 +856,88 @@ spec:
 	require.Equal(t, []string{"first", "second"}, twinPatches, "the later definition must be applied last")
 }
 
+// TestUpdateFatalErrorStopsLaterKinds makes the existence check of one ConfigMap fail with
+// an error other than NotFound. That is fatal, and the Pods that come after the ConfigMaps
+// in install order must never be touched.
+func TestUpdateFatalErrorStopsLaterKinds(t *testing.T) {
+	const manifest = `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-ok
+  namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-forbidden
+  namespace: default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-a
+  namespace: default
+spec:
+  containers:
+  - name: app
+    image: abc/app:v4
+`
+	cb := func(_ []RequestResponseAction, req *http.Request) (*http.Response, error) {
+		name := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		if name == "cm-forbidden" && req.Method == http.MethodGet {
+			return newResponse(http.StatusForbidden, &metav1.Status{
+				Status:  metav1.StatusFailure,
+				Reason:  metav1.StatusReasonForbidden,
+				Message: "configmaps \"cm-forbidden\" is forbidden",
+				Code:    http.StatusForbidden,
+			})
+		}
+		if strings.Contains(req.URL.Path, "/configmaps/") {
+			return newResponse(http.StatusOK, &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: v1.NamespaceDefault}})
+		}
+		pod := newPod(name)
+		return newResponse(http.StatusOK, &pod)
+	}
+
+	c := newTestClient(t)
+	client := NewRequestResponseLogClient(t, cb)
+	c.Factory.(*cmdtesting.TestFactory).UnstructuredClient = newConcurrentRESTClient(client.Do)
+
+	originals, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+	targets, err := c.Build(strings.NewReader(manifest), false)
+	require.NoError(t, err)
+
+	_, err = c.Update(originals, targets, ClientUpdateOptionServerSideApply(true, false))
+	require.ErrorContains(t, err, "could not get information about the resource")
+
+	for _, action := range client.Actions {
+		assert.NotContains(t, action.Request.URL.Path, "/pods/", "a later kind was applied after a fatal error")
+	}
+}
+
+// TestForEachKindBatchLimitGuard checks that a limit below one does not deadlock the helper.
+func TestForEachKindBatchLimitGuard(t *testing.T) {
+	pods := newPodList("starfish", "otter", "squid")
+	c := newTestClient(t)
+	list, err := c.Build(objBody(&pods), false)
+	require.NoError(t, err)
+
+	var visited atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		done <- forEachKindBatch(list, 0, func(int) error { visited.Add(1); return nil })
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		assert.Equal(t, int32(len(pods.Items)), visited.Load())
+	case <-time.After(5 * time.Second):
+		t.Fatal("forEachKindBatch with limit 0 did not finish")
+	}
+}
+
 // TestUpdateAppliesKindsInOrder checks the barrier between kinds: every
 // request for the ConfigMaps, which come first in install order, completes
 // before the first request for a Pod is sent.
